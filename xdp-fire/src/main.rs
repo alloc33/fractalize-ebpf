@@ -480,8 +480,7 @@ async fn main() -> anyhow::Result<()> {
         return handle_command(command).await;
     }
 
-    // Bump the memlock rlimit. This is needed for older kernels that don't use the
-    // new memcg based accounting, see https://lwn.net/Articles/837122/
+    // Bump memlock rlimit for older kernels
     let rlim = libc::rlimit {
         rlim_cur: libc::RLIM_INFINITY,
         rlim_max: libc::RLIM_INFINITY,
@@ -498,17 +497,12 @@ async fn main() -> anyhow::Result<()> {
         std::fs::remove_dir_all(map_pin_path).ok();
     }
 
-    // This will include your eBPF object file as raw bytes at compile-time and load it at
-    // runtime. This approach is recommended for most real-world use cases. If you would
-    // like to specify the eBPF program at runtime rather than at compile-time, you can
-    // reach for `Bpf::load_file` instead.
     let mut ebpf = aya::Ebpf::load(aya::include_bytes_aligned!(concat!(
         env!("OUT_DIR"),
         "/xdp-fire"
     )))?;
     match aya_log::EbpfLogger::init(&mut ebpf) {
         Err(e) => {
-            // This can happen if you remove all log statements from your eBPF program.
             warn!("failed to initialize eBPF logger: {e}");
         }
         Ok(logger) => {
@@ -526,15 +520,10 @@ async fn main() -> anyhow::Result<()> {
     // Configure port filtering rules before attaching
     let mut port_rules: HashMap<_, u16, u8> = ebpf.map_mut("PORT_RULES").unwrap().try_into()?;
 
-    // Default configuration: Monitor Substrate P2P port (30333) without dropping
     port_rules.insert(30333_u16, Action::LogOnly as u8, 0)?;
 
-    // You can add more ports here:
-    // port_rules.insert(9944_u16, Action::LogOnly as u8, 0)?;  // Substrate RPC WebSocket
-    // port_rules.insert(9933_u16, Action::LogOnly as u8, 0)?;  // Substrate RPC HTTP
-
-    // Pin the maps so they can be accessed by runtime configuration commands
-    std::fs::create_dir_all(map_pin_path).ok(); // Create directory if it doesn't exist
+    // Pin maps for runtime access
+    std::fs::create_dir_all(map_pin_path).ok();
     port_rules.pin(map_pin_path.join("PORT_RULES"))?;
 
     // Also pin PORT_STATS for statistics access
@@ -640,16 +629,11 @@ async fn main() -> anyhow::Result<()> {
 mod tests {
     use super::*;
 
-    // IPv6 conversion tests - we store IPv6 as [u32; 4] in eBPF maps because
-    // eBPF doesn't handle complex types well. Need to make sure conversion is lossless.
-
     #[test]
     fn test_ipv6_to_u32_array_simple() {
-        // Simple address with :: notation
         let ipv6 = "2001:db8::1".parse::<Ipv6Addr>().unwrap();
         let array = ipv6_to_u32_array(&ipv6);
 
-        // 2001:0db8:0000:0000:0000:0000:0000:0001
         assert_eq!(array[0], 0x2001_0db8);
         assert_eq!(array[1], 0x0000_0000);
         assert_eq!(array[2], 0x0000_0000);
@@ -658,7 +642,6 @@ mod tests {
 
     #[test]
     fn test_ipv6_to_u32_array_full() {
-        // Full IPv6 address with all sections populated
         let ipv6 = "2001:db8:85a3::8a2e:370:7334".parse::<Ipv6Addr>().unwrap();
         let array = ipv6_to_u32_array(&ipv6);
 
@@ -670,7 +653,6 @@ mod tests {
 
     #[test]
     fn test_ipv6_to_u32_array_loopback() {
-        // Edge case: loopback address (::1)
         let ipv6 = "::1".parse::<Ipv6Addr>().unwrap();
         let array = ipv6_to_u32_array(&ipv6);
 
@@ -682,15 +664,13 @@ mod tests {
 
     #[test]
     fn test_u32_array_to_ipv6_roundtrip() {
-        // Most important test - make sure we don't lose any data during conversion
-        // Test multiple addresses including edge cases
         let test_cases = [
             "2001:db8::1",
-            "::1",     // Loopback
-            "fe80::1", // Link-local
+            "::1",
+            "fe80::1",
             "2001:db8:85a3::8a2e:370:7334",
-            "::",                                      // All zeros
-            "ffff:ffff:ffff:ffff:ffff:ffff:ffff:ffff", // All ones
+            "::",
+            "ffff:ffff:ffff:ffff:ffff:ffff:ffff:ffff",
         ];
 
         for case in &test_cases {
@@ -703,7 +683,6 @@ mod tests {
 
     #[test]
     fn test_u32_array_to_ipv6_manual() {
-        // Manually verify the reverse conversion works
         let array: [u32; 4] = [0x2001_0db8, 0x0000_0000, 0x0000_0000, 0x0000_0001];
         let ipv6 = u32_array_to_ipv6(&array);
         let expected = "2001:db8::1".parse::<Ipv6Addr>().unwrap();
@@ -712,13 +691,8 @@ mod tests {
 
     #[test]
     fn test_ipv6_network_byte_order() {
-        // Critical: IPv6 addresses must be in network byte order (big-endian)
-        // for eBPF map lookups to work correctly
         let ipv6 = "2001:db8::1".parse::<Ipv6Addr>().unwrap();
         let array = ipv6_to_u32_array(&ipv6);
-
-        // First u32 should be 0x2001_0db8 in big-endian
-        // If we were using little-endian (wrong!), it would be 0xb80d_0120
-        assert_eq!(array[0], 0x2001_0db8, "Not using network byte order!");
+        assert_eq!(array[0], 0x2001_0db8);
     }
 }

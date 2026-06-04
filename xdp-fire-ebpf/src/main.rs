@@ -19,39 +19,21 @@ use network_types::{
 };
 use xdp_fire_common::{actions::*, ip_filter::*, logging::*, rate_limit::*};
 
-/// Port-based filtering rules (runtime configurable from userspace)
-/// Key: port number (u16)
-/// Value: action (u8) - see Action enum (0=Pass, 1=Drop, 2=LogOnly)
 #[map]
 static PORT_RULES: HashMap<u16, u8> = HashMap::with_max_entries(100, 0);
 
-/// Per-port packet statistics (runtime readable from userspace)
-/// Key: port number (u16)
-/// Value: packet count (u64)
 #[map]
 static PORT_STATS: HashMap<u16, u64> = HashMap::with_max_entries(100, 0);
 
-/// IPv4 filter list (allowlist or blocklist, depending on mode)
-/// Key: IPv4 address as u32 (network byte order)
-/// Value: 1 = present in list
 #[map]
 static IP_FILTER_LIST_V4: HashMap<u32, u8> = HashMap::with_max_entries(10000, 0);
 
-/// IPv6 filter list (allowlist or blocklist, depending on mode)
-/// Key: IPv6 address as [u32; 4] (network byte order)
-/// Value: 1 = present in list
 #[map]
 static IP_FILTER_LIST_V6: HashMap<[u32; 4], u8> = HashMap::with_max_entries(10000, 0);
 
-/// Per-IP rate limiting state for IPv4
-/// Key: IPv4 address as u32 (network byte order)
-/// Value: packed u64 (timestamp + packet count)
 #[map]
 static RATE_LIMIT_STATE_V4: HashMap<u32, u64> = HashMap::with_max_entries(10000, 0);
 
-/// Per-IP rate limiting state for IPv6
-/// Key: IPv6 address as [u32; 4] (network byte order)
-/// Value: packed u64 (timestamp + packet count)
 #[map]
 static RATE_LIMIT_STATE_V6: HashMap<[u32; 4], u64> = HashMap::with_max_entries(10000, 0);
 
@@ -62,25 +44,12 @@ const STAT_UDP_PACKETS: u32 = 2;
 const STAT_SUBSTRATE_PACKETS: u32 = 3;
 const STAT_NON_IP_PACKETS: u32 = 4;
 
-/// Packet statistics map
-/// - Index 0: Total packets processed
-/// - Index 1: TCP packets
-/// - Index 2: UDP packets
-/// - Index 3: Substrate P2P packets (port 30333, TCP or UDP)
-/// - Index 4: Non-IP packets (ARP, etc.)
 #[map]
 static STATS: Array<u64> = Array::with_max_entries(5, 0);
 
-/// Configuration map (runtime configurable from userspace)
-/// Index 0: Log level (0=None, 1=DropsOnly, 2=Filtered, 3=All)
-/// Index 1: IP filter mode (0=Disabled, 1=Blocklist, 2=Allowlist)
-/// Index 2: Rate limit enabled (0=Disabled, 1=Enabled)
-/// Index 3: Rate limit PPS (packets per second)
-/// Index 4: Rate limit window (milliseconds)
 #[map]
 static CONFIG: Array<u32> = Array::with_max_entries(10, 0);
 
-/// Get current log level from CONFIG map
 #[inline(always)]
 fn get_log_level() -> LogLevel {
     match CONFIG.get(CONFIG_LOG_LEVEL) {
@@ -89,7 +58,6 @@ fn get_log_level() -> LogLevel {
     }
 }
 
-/// Get current IP filter mode from CONFIG map
 #[inline(always)]
 fn get_ip_filter_mode() -> IpFilterMode {
     match CONFIG.get(CONFIG_IP_FILTER_MODE) {
@@ -98,7 +66,6 @@ fn get_ip_filter_mode() -> IpFilterMode {
     }
 }
 
-/// Check if IP address should be allowed based on filter mode (generic for IPv4/IPv6)
 /// Returns true if packet should be allowed, false if it should be dropped
 #[inline(always)]
 fn check_ip_allowed<T>(map: &HashMap<T, u8>, ip: &T, filter_mode: IpFilterMode) -> bool
@@ -118,16 +85,12 @@ where
     }
 }
 
-/// Get current timestamp in milliseconds
 #[inline(always)]
 fn get_current_time_ms() -> u32 {
     // bpf_ktime_get_ns returns nanoseconds since boot
-    // Convert to milliseconds, but keep only lower 32 bits (wraps every ~49 days)
     (unsafe { bpf_ktime_get_ns() } / 1_000_000) as u32
 }
 
-/// Get rate limiting configuration from CONFIG map
-/// Returns (enabled, pps_limit, window_ms)
 #[inline(always)]
 fn get_rate_limit_config() -> (bool, u32, u32) {
     let enabled = match CONFIG.get(CONFIG_RATE_LIMIT_ENABLED) {
@@ -142,8 +105,6 @@ fn get_rate_limit_config() -> (bool, u32, u32) {
     (enabled, pps_limit, window_ms)
 }
 
-/// Check if IP address is within rate limit (generic for IPv4/IPv6)
-/// Returns true if packet should be allowed, false if rate limit exceeded
 #[inline(always)]
 fn check_rate_limit<T>(map: &HashMap<T, u64>, ip: &T, pps_limit: u32, window_ms: u32) -> bool
 where
@@ -184,8 +145,6 @@ where
     new_state.packet_count <= pps_limit
 }
 
-/// Helper function to increment a statistic counter with zero overhead
-/// Uses get_ptr_mut for direct memory access without bounds checking in hot path
 #[inline(always)]
 fn inc_stat(index: u32) {
     if let Some(counter) = STATS.get_ptr_mut(index) {
@@ -193,7 +152,6 @@ fn inc_stat(index: u32) {
     }
 }
 
-/// Increment packet counter for a specific port
 #[inline(always)]
 fn inc_port_stat(port: u16) {
     unsafe {
@@ -202,8 +160,6 @@ fn inc_port_stat(port: u16) {
     }
 }
 
-/// Macro to check a single port rule and handle action
-/// Reduces code duplication for src/dst port checks
 macro_rules! check_single_port {
     ($ctx:expr, $port:expr, $log_level:expr, $direction:expr) => {
         if let Some(action_code) = unsafe { PORT_RULES.get(&$port) } {
@@ -237,23 +193,18 @@ macro_rules! check_single_port {
     };
 }
 
-/// Check if packet port has a filtering rule and apply it
 /// Returns Some(action) if rule exists, None if no rule (pass through)
 #[inline(always)]
 fn check_port_rule(ctx: &XdpContext, src_port: u16, dst_port: u16) -> Option<u32> {
     let log_level = get_log_level();
 
-    // Check destination port first (more common for server ports)
     check_single_port!(ctx, dst_port, log_level, "to");
 
-    // Check source port (for responses from monitored services)
     check_single_port!(ctx, src_port, log_level, "from");
 
     None
 }
 
-/// Macro to handle IP filtering and rate limiting for both IPv4 and IPv6
-/// Reduces code duplication between IPv4/IPv6 code paths
 macro_rules! check_ip_and_rate_limit {
 	(
 		$ctx:expr,         // XDP context (for logging)
@@ -321,24 +272,14 @@ fn try_xdp_fire(ctx: XdpContext) -> Result<u32, ()> {
     let ip_filter_mode = get_ip_filter_mode();
     let (rate_limit_enabled, pps_limit, window_ms) = get_rate_limit_config();
 
-    // Parse Ethernet header - use offset_of! for efficiency (only validate the field we need)
-    // [dst MAC 6B][src MAC 6B][EtherType 2B][IP header...][TCP/UDP...]
-    //  ^                       ^
-    //  ctx.data()              ptr_at returns pointer here (offset 12)
     let ether_type: *const EtherType = ptr_at(&ctx, mem::offset_of!(EthHdr, ether_type))?;
 
-    // Parse IP layer (IPv4 or IPv6) using EtherType enum
     let (ip_proto, tcp_offset) = match unsafe { *ether_type } {
         EtherType::Ipv4 => {
-            // IPv4
             let ipv4hdr: *const Ipv4Hdr = ptr_at(&ctx, EthHdr::LEN)?;
             let src_addr = unsafe { (*ipv4hdr).src_addr };
             let dst_addr = unsafe { (*ipv4hdr).dst_addr };
-
-            // Convert source IP to u32 (already in network byte order)
             let src_ip = u32::from_be_bytes(src_addr);
-
-            // Check IP filtering and rate limiting
             check_ip_and_rate_limit!(
                 &ctx,
                 &IP_FILTER_LIST_V4,
@@ -357,7 +298,7 @@ fn try_xdp_fire(ctx: XdpContext) -> Result<u32, ()> {
             );
 
             let proto = unsafe { (*ipv4hdr).proto };
-            let ihl = unsafe { (*ipv4hdr).ihl() }; // Get header length (20-60 bytes)
+            let ihl = unsafe { (*ipv4hdr).ihl() };
             (proto, EthHdr::LEN + ihl as usize)
         }
         EtherType::Ipv6 => {
@@ -366,8 +307,6 @@ fn try_xdp_fire(ctx: XdpContext) -> Result<u32, ()> {
             let src_addr = unsafe { (*ipv6hdr).src_addr };
             let dst_addr = unsafe { (*ipv6hdr).dst_addr };
 
-            // Convert IPv6 source address to [u32; 4] for map lookup
-            // IPv6 is already in network byte order (big-endian)
             let src_ip: [u32; 4] = [
                 u32::from_be_bytes([src_addr[0], src_addr[1], src_addr[2], src_addr[3]]),
                 u32::from_be_bytes([src_addr[4], src_addr[5], src_addr[6], src_addr[7]]),
@@ -375,7 +314,6 @@ fn try_xdp_fire(ctx: XdpContext) -> Result<u32, ()> {
                 u32::from_be_bytes([src_addr[12], src_addr[13], src_addr[14], src_addr[15]]),
             ];
 
-            // Check IP filtering and rate limiting
             check_ip_and_rate_limit!(
                 &ctx,
                 &IP_FILTER_LIST_V6,
@@ -401,13 +339,11 @@ fn try_xdp_fire(ctx: XdpContext) -> Result<u32, ()> {
             (next_hdr, EthHdr::LEN + Ipv6Hdr::LEN)
         }
         _ => {
-            // Not IP packet (ARP, etc.)
             inc_stat(STAT_NON_IP_PACKETS);
             return Ok(xdp_action::XDP_PASS);
         }
     };
 
-    // Parse transport layer (TCP or UDP)
     match ip_proto {
         IpProto::Tcp => {
             inc_stat(STAT_TCP_PACKETS);
@@ -419,7 +355,6 @@ fn try_xdp_fire(ctx: XdpContext) -> Result<u32, ()> {
                 info!(&ctx, "TCP: port {} → {}", src_port, dst_port);
             }
 
-            // Check for port-based filtering rules
             if let Some(action) = check_port_rule(&ctx, src_port, dst_port) {
                 return Ok(action);
             }
@@ -434,7 +369,6 @@ fn try_xdp_fire(ctx: XdpContext) -> Result<u32, ()> {
                 info!(&ctx, "UDP: port {} → {}", src_port, dst_port);
             }
 
-            // Check for port-based filtering rules
             if let Some(action) = check_port_rule(&ctx, src_port, dst_port) {
                 return Ok(action);
             }
